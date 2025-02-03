@@ -1,6 +1,7 @@
 # 网络助手
 
 该项目是一个使用 Vue.js 和 Tauri 构建的应用程序，旨在管理 TCP、UDP 和串口连接。它提供了一个用户友好的界面，用于配置和控制网络通信和串口操作。
+![](https://obsidian-1255729190.cos.ap-shanghai.myqcloud.com/serial_port.png)
 
 ## 功能
 
