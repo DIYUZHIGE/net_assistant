@@ -5,25 +5,38 @@ use std::io::{BufReader, Read, Write};
 use std::thread::sleep;
 use std::time::Duration;
 use std::{
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{Arc, Mutex},
 };
 use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+
 // TCP Server
+
 #[derive(Default)]
-struct TcpServer {
+struct TcpServerForm {
     ip: String,
     port: String,
-    listener: Mutex<Option<TcpListener>>,
 }
 lazy_static! {
-    static ref TCP_SERVER_STREAM: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
-    static ref TCP_SERVER: Arc<Mutex<TcpServer>> = Arc::new(Mutex::new(TcpServer::default()));
-    static ref TCP_SERVER_HISTORY: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    static ref TCP_SERVER_STREAM_READ: tokio::sync::Mutex<Option<tokio::io::ReadHalf<tokio::net::TcpStream>>> =
+        tokio::sync::Mutex::new(None);
+    static ref TCP_SERVER_STREAM_WRITE: tokio::sync::Mutex<Option<tokio::io::WriteHalf<tokio::net::TcpStream>>> =
+        tokio::sync::Mutex::new(None);
+    static ref TCP_SERVER_FORM: Arc<Mutex<TcpServerForm>> =
+        Arc::new(Mutex::new(TcpServerForm::default()));
+    static ref TCP_SERVER_HISTORY: Arc<Mutex<TcpServerHistory>> =
+        Arc::new(Mutex::new(TcpServerHistory::default()));
+    static ref TCP_SERVER_STATUS: Arc<Mutex<TcpServerStatus>> =
+        Arc::new(Mutex::new(TcpServerStatus::default()));
+    static ref TCP_SERVER_LISTENING_TASK: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(None));
+    static ref TCP_SERVER_RECEIVING_TASK: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(None));
 }
 
-impl TcpServer {
+impl TcpServerForm {
     fn set_ip(&mut self, ip: String) {
         self.ip = ip;
     }
@@ -31,148 +44,128 @@ impl TcpServer {
     fn set_port(&mut self, port: String) {
         self.port = port;
     }
-
-    fn listen(&mut self) {
-        let address = format!("{}:{}", self.ip, self.port);
-        println!(" address : {}", address);
-        let listen_result = TcpListener::bind(address);
-        match listen_result {
-            Ok(listener) => {
-                self.listener.lock().unwrap().replace(listener);
-                self.wait_for_stream();
-            }
-            Err(e) => {
-                println!("Failed to open stream: {:?}", e);
-            }
-        }
-    }
-
-    fn wait_for_stream(&mut self) {
-        println!("waiting for stream");
-
-        let tcp_server_status = TcpServerStatus {
-            status: "listening".to_string(),
-        };
-        let app_handle = get_apphandle();
-        update_tcp_server_status(&app_handle, &tcp_server_status);
-        let (mut stream, _) = self
-            .listener
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .accept()
-            .unwrap();
-        tokio::spawn(async move {
-            handle_tcp_server_stream(&mut stream);
-        });
-    }
-
-    fn destroy(&mut self) {
-        self.listener.lock().unwrap().take();
-    }
 }
 
-fn handle_tcp_server_stream(stream: &mut TcpStream) {
-    TCP_SERVER_STREAM
-        .lock()
-        .unwrap()
-        .replace(stream.try_clone().unwrap());
-    println!("handling stream");
-    let mut reader = BufReader::new(stream);
-    let mut buffer = [0; 512];
-
+async fn handle_tcp_server_stream() {
+    println!("message receiving");
+    let mut buf = vec![0u8; 512];
     loop {
-        println!("waiting for message");
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                println!("Client disconnected");
-                break;
-            }
-            Ok(n) => {
-                let message = String::from_utf8_lossy(&buffer[..n]);
-                println!("message received: {}", message);
-                let message = format!("received: {}\n", message);
-                TCP_SERVER_HISTORY.lock().unwrap().push_str(&message);
-                let tcp_server_history = TcpServerHistory {
-                    history: TCP_SERVER_HISTORY.lock().unwrap().clone(),
-                };
-                let app_handle = get_apphandle();
-                update_tcp_server_history(&app_handle, &tcp_server_history);
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(e) => {
-                println!("Error reading from stream: {:?}", e);
-                break;
-            }
+        println!("message receiving");
+        let length = TCP_SERVER_STREAM_READ
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .read(&mut buf)
+            .await
+            .unwrap();
+        if length == 0 {
+            break;
         }
+        let message = format!(
+            "接收: {}\n",
+            String::from_utf8_lossy(&buf.as_slice()[..length])
+        );
+        println!("{}", message);
+        TCP_SERVER_HISTORY
+            .lock()
+            .unwrap()
+            .history
+            .push_str(&message);
+        TCP_SERVER_HISTORY.lock().unwrap().update();
+        println!("received one message");
     }
 }
 
 #[tauri::command(async)]
 async fn tcp_server_establish() {
-    println!("establishing");
-    TCP_SERVER.lock().unwrap().listen();
-    println!("listening");
+    TCP_SERVER_LISTENING_TASK
+        .lock()
+        .unwrap()
+        .replace(tokio::spawn(tcp_server_listening()));
+    TCP_SERVER_STATUS.lock().unwrap().set("established".into());
+    TCP_SERVER_STATUS.lock().unwrap().update();
+    println!("established");
+}
 
-    let tcp_server_status = TcpServerStatus {
-        status: "established".to_string(),
-    };
-    let app_handle = get_apphandle();
-    update_tcp_server_status(&app_handle, &tcp_server_status);
+#[tauri::command(async)]
+async fn tcp_server_listening() {
+    let ip = TCP_SERVER_FORM.lock().unwrap().ip.clone();
+    let port = TCP_SERVER_FORM.lock().unwrap().port.clone();
+    let addr = format!("{}:{}", ip, port);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let (read_socket, write_socket) = tokio::io::split(socket);
+
+        TCP_SERVER_STREAM_READ
+            .lock()
+            .await
+            .replace(read_socket);
+        TCP_SERVER_STREAM_WRITE
+            .lock()
+            .await
+            .replace(write_socket);
+        println!("A CONNECTION!");
+        TCP_SERVER_RECEIVING_TASK
+            .lock()
+            .unwrap()
+            .replace(tokio::spawn(handle_tcp_server_stream()));
+
+        println!("NEXT!");
+    }
 }
 
 #[tauri::command(async)]
 async fn tcp_server_destroy() {
-    println!("destroying");
-    TCP_SERVER.lock().unwrap().destroy();
-    TCP_SERVER_STREAM.lock().unwrap().take();
-    println!("destroyed");
-    let tcp_server_status = TcpServerStatus {
-        status: "destroyed".to_string(),
-    };
-    let app_handle = get_apphandle();
-    update_tcp_server_status(&app_handle, &tcp_server_status);
+    if TCP_SERVER_LISTENING_TASK.lock().unwrap().is_some() {
+        TCP_SERVER_LISTENING_TASK
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .abort();
+    }
+    if TCP_SERVER_RECEIVING_TASK.lock().unwrap().is_some() {
+        TCP_SERVER_RECEIVING_TASK
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .abort();
+    }
+
+    TCP_SERVER_LISTENING_TASK.clear_poison();
+    TCP_SERVER_RECEIVING_TASK.clear_poison();
+
+    TCP_SERVER_STATUS.lock().unwrap().set("destroyed".into());
+    TCP_SERVER_STATUS.lock().unwrap().update();
 }
 
 #[tauri::command]
 async fn update_tcp_server_form(ip: String, port: String) {
-    TCP_SERVER.lock().unwrap().set_ip(ip.clone());
-    TCP_SERVER.lock().unwrap().set_port(port.clone());
+    TCP_SERVER_FORM.lock().unwrap().set_ip(ip.clone());
+    TCP_SERVER_FORM.lock().unwrap().set_port(port.clone());
     println!("updated address : {}:{}", ip, port);
 }
 
 #[tauri::command(async)]
 async fn tcp_server_send(message: String) {
-    println!("sending: {}", message);
-    TCP_SERVER_STREAM
+    println!("{}", message);
+    TCP_SERVER_STREAM_WRITE
         .lock()
-        .unwrap()
+        .await
         .as_mut()
         .unwrap()
-        .write(message.as_bytes())
-        .unwrap();
-    TCP_SERVER_STREAM
+        .write(message.as_bytes()).await.unwrap();
+    let message = format!("发送: {}\n", message);
+    TCP_SERVER_HISTORY
         .lock()
         .unwrap()
-        .as_mut()
-        .unwrap()
-        .flush()
-        .unwrap();
-    println!("sented: {}", message);
-    let message = format!("sent: {}\n", message);
-    TCP_SERVER_HISTORY.lock().unwrap().push_str(&message);
-    let tcp_server_history = TcpServerHistory {
-        history: TCP_SERVER_HISTORY.lock().unwrap().clone(),
-    };
-    let app_handle = get_apphandle();
-    update_tcp_server_history(&app_handle, &tcp_server_history);
-}
-
-fn update_tcp_server_history(app: &AppHandle, history: &TcpServerHistory) {
-    app.emit("update_tcp_server_history", history).unwrap();
+        .history
+        .push_str(&message);
+    TCP_SERVER_HISTORY.lock().unwrap().update();
 }
 
 // TCP Client
@@ -183,13 +176,34 @@ struct TcpClient {
     port: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct TcpServerStatus {
     status: String,
 }
+
+impl TcpServerStatus {
+    fn set(&mut self, status: String) {
+        self.status = status;
+    }
+
+    fn update(&self) {
+        let app_handle = get_apphandle();
+        app_handle.emit("update_tcp_server_status", self).unwrap();
+    }
+}
+
 #[derive(Serialize, Default)]
 struct TcpServerHistory {
     history: String,
+}
+
+impl TcpServerHistory {
+    fn update(&self) {
+        let app_handle = get_apphandle();
+        app_handle
+            .emit("update_tcp_server_history", &self)
+            .unwrap();
+    }
 }
 #[derive(Serialize)]
 struct TcpClientHistory {
@@ -242,7 +256,7 @@ fn handle_tcp_client_stream(stream: &mut TcpStream) {
             Ok(n) => {
                 let message = String::from_utf8_lossy(&buffer[..n]);
                 println!("message received: {}", message);
-                let message = format!("received: {}\n", message);
+                let message = format!("接收: {}\n", message);
                 TCP_CLIENT_HISTORY.lock().unwrap().push_str(&message);
                 let tcp_client_history = TcpClientHistory {
                     history: TCP_CLIENT_HISTORY.lock().unwrap().clone(),
@@ -314,10 +328,6 @@ fn update_tcp_client_status(app: &AppHandle, status: &TcpClientStatus) {
     app.emit("update_tcp_client_status", status).unwrap();
 }
 
-fn update_tcp_server_status(app: &AppHandle, status: &TcpServerStatus) {
-    app.emit("update_tcp_server_status", status).unwrap();
-}
-
 #[tauri::command(async)]
 async fn tcp_client_send(message: String) {
     TCP_CLIENT_STREAM.clear_poison();
@@ -336,7 +346,7 @@ async fn tcp_client_send(message: String) {
         .flush()
         .unwrap();
 
-    let message = format!("sent: {}\n", message);
+    let message = format!("发送: {}\n", message);
     TCP_CLIENT_HISTORY.lock().unwrap().push_str(&message);
     let tcp_client_history = TcpClientHistory {
         history: TCP_CLIENT_HISTORY.lock().unwrap().clone(),
@@ -498,7 +508,7 @@ async fn udp_send(message: String) {
         .send_to(message.as_bytes(), to_address)
         .await
         .unwrap();
-    let message = format!("sent: {}\n", message);
+    let message = format!("发送: {}\n", message);
     UDP_CLIENT_HISTORY.lock().unwrap().append(&message);
     UDP_CLIENT_HISTORY.lock().unwrap().update();
     println!("sented: {}", message);
@@ -517,7 +527,7 @@ async fn udp_receive(udp_socket: UdpSocket) {
             .recv_from(&mut buf)
             .await
             .unwrap();
-        let message = format!("received: {}\n", String::from_utf8_lossy(&buf[..length]));
+        let message = format!("接收: {}\n", String::from_utf8_lossy(&buf[..length]));
         println!("{}", message);
         UDP_CLIENT_HISTORY.lock().unwrap().append(&message);
         UDP_CLIENT_HISTORY.lock().unwrap().update();
@@ -707,7 +717,7 @@ async fn serial_port_open() {
         5 => serial2::CharSize::Bits5,
         _ => serial2::CharSize::Bits8,
     };
-    let stop_bits = match SERIAL_PORT_FORM.lock().unwrap().as_ref().unwrap().stop_bits{
+    let stop_bits = match SERIAL_PORT_FORM.lock().unwrap().as_ref().unwrap().stop_bits {
         1 => serial2::StopBits::One,
         2 => serial2::StopBits::Two,
         _ => serial2::StopBits::One,
@@ -716,13 +726,12 @@ async fn serial_port_open() {
     println!("port name: {}", port_name);
     println!("baud rate: {}", baud_rate);
 
-    let settting_fn =
-        |mut s: serial2::Settings| -> std::io::Result<serial2::Settings> {
-            s.set_baud_rate(baud_rate).unwrap();
-            s.set_char_size(data_bits);
-            s.set_stop_bits(stop_bits);
-             Ok(s) 
-        };
+    let settting_fn = |mut s: serial2::Settings| -> std::io::Result<serial2::Settings> {
+        s.set_baud_rate(baud_rate).unwrap();
+        s.set_char_size(data_bits);
+        s.set_stop_bits(stop_bits);
+        Ok(s)
+    };
     *SERIAL_PORT.write().await = Some(SerialPort::open(&port_name, settting_fn).unwrap());
     SERIAL_PORT_STATUS
         .lock()
@@ -742,7 +751,7 @@ async fn serial_port_receive() {
         match SERIAL_PORT.read().await.as_ref().unwrap().read(&mut buf) {
             Ok(length) => {
                 println!("received: {}", String::from_utf8_lossy(&buf[..length]));
-                let message = format!("received: {}\n", String::from_utf8_lossy(&buf[..length]));
+                let message = format!("接收: {}\n", String::from_utf8_lossy(&buf[..length]));
                 SERIAL_PORT_HISTORY.lock().unwrap().append(&message);
                 SERIAL_PORT_HISTORY.lock().unwrap().update();
             }
@@ -780,7 +789,7 @@ async fn serial_port_write(message: String) {
         .unwrap()
         .write(message.as_bytes())
         .unwrap();
-    let message = format!("sent: {}\n", message);
+    let message = format!("发送: {}\n", message);
     SERIAL_PORT_HISTORY.lock().unwrap().append(&message);
     SERIAL_PORT_HISTORY.lock().unwrap().update();
 }

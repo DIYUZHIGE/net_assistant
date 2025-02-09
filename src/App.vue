@@ -35,7 +35,7 @@
           </el-form-item>
           <el-form-item>
             <el-button type="primary" @click="tcp_server_control" style="width: 100%">{{ tcp_server_form.status ==
-              'destroyed' ? '建立' : tcp_server_form.status == 'listening' ? '监听' : '断开' }}</el-button>
+              'destroyed' ? '建立' : '断开' }}</el-button>
           </el-form-item>
           <el-form-item label="数据历史" label-position="top">
             <el-input type="textarea" v-model="tcp_server_form.data_history" placeholder="数据历史" :rows="4"
@@ -346,4 +346,5 @@ const serial_port_get_ports = async () => {
 }
 </script>
 
-<style></style>
+<style scoped>
+</style>

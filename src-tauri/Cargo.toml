@@ -29,4 +29,5 @@ tauri-plugin-os = "2"
 tokio-serial = "5.4.5"
 mio-serial = "5.0.6"
 serial2 = "0.2.28"
+mini-redis = "0.4.1"
 
