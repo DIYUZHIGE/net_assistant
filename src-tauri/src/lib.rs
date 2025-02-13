@@ -99,14 +99,8 @@ async fn tcp_server_listening() {
 
         let (read_socket, write_socket) = tokio::io::split(socket);
 
-        TCP_SERVER_STREAM_READ
-            .lock()
-            .await
-            .replace(read_socket);
-        TCP_SERVER_STREAM_WRITE
-            .lock()
-            .await
-            .replace(write_socket);
+        TCP_SERVER_STREAM_READ.lock().await.replace(read_socket);
+        TCP_SERVER_STREAM_WRITE.lock().await.replace(write_socket);
         println!("A CONNECTION!");
         TCP_SERVER_RECEIVING_TASK
             .lock()
@@ -158,7 +152,9 @@ async fn tcp_server_send(message: String) {
         .await
         .as_mut()
         .unwrap()
-        .write(message.as_bytes()).await.unwrap();
+        .write(message.as_bytes())
+        .await
+        .unwrap();
     let message = format!("发送: {}\n", message);
     TCP_SERVER_HISTORY
         .lock()
@@ -200,9 +196,7 @@ struct TcpServerHistory {
 impl TcpServerHistory {
     fn update(&self) {
         let app_handle = get_apphandle();
-        app_handle
-            .emit("update_tcp_server_history", &self)
-            .unwrap();
+        app_handle.emit("update_tcp_server_history", &self).unwrap();
     }
 }
 #[derive(Serialize)]
@@ -726,13 +720,13 @@ async fn serial_port_open() {
     println!("port name: {}", port_name);
     println!("baud rate: {}", baud_rate);
 
-    let settting_fn = |mut s: serial2::Settings| -> std::io::Result<serial2::Settings> {
+    let setting_fn = |mut s: serial2::Settings| -> std::io::Result<serial2::Settings> {
         s.set_baud_rate(baud_rate).unwrap();
         s.set_char_size(data_bits);
         s.set_stop_bits(stop_bits);
         Ok(s)
     };
-    *SERIAL_PORT.write().await = Some(SerialPort::open(&port_name, settting_fn).unwrap());
+    *SERIAL_PORT.write().await = Some(SerialPort::open(&port_name, setting_fn).unwrap());
     SERIAL_PORT_STATUS
         .lock()
         .unwrap()

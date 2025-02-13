@@ -115,8 +115,6 @@
           <el-form-item label="流控" label-position="top">
             <el-select v-model="serial_port_form.flow_control" placeholder="请选择流控">
               <el-option label="无流控" value="none" />
-              <el-option label="软件流控" value="software" />
-              <el-option label="硬件流控" value="hardware" />
             </el-select>
           </el-form-item>
           <el-form-item>
